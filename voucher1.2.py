@@ -562,7 +562,7 @@ async def on_ready():
         status=discord.Status.online,
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name="vouches"
+            name="Vouchers and Servers, .gg/QHS9q6mFfE join for Help!"
         )
     )
 
@@ -955,5 +955,6 @@ async def shutdown(interaction: discord.Interaction, code: str):
 
 
 bot.run(TOKEN)
+
 
 
