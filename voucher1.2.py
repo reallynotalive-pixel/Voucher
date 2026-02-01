@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import os
 import discord
 import pyotp
 import sys
@@ -9,7 +10,23 @@ from datetime import datetime, timedelta, timezone
 from discord import app_commands
 from discord.ext import commands
 
-TOKEN = ""
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Read secrets from environment variables
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+TOTP_SECRET = os.getenv("TOTP_SECRET", "").strip()
+
+if not TOKEN:
+    raise RuntimeError(
+        "DISCORD_TOKEN is not set. Set it in ~/.bashrc (export DISCORD_TOKEN=...) "
+        "or create a .env file with DISCORD_TOKEN=..."
+
+ if not TOTP_SECRET:
+    print("WARNING: TOTP_SECRET is not set. /shutdown will not work until you set it.")
+
+    )
 
 # ---------- INTENTS ----------
 intents = discord.Intents.default()
@@ -18,7 +35,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------- CONFIG ----------
 OWNER_ID = 906781117632368730
-TOTP_SECRET = ""
 STATUS_CHANNEL_ID = 1461148246863773698
 
 DB_FILE = "vouches.db"
