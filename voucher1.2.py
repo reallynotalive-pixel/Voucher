@@ -558,6 +558,14 @@ _sent_online = False
 async def on_ready():
     global _sent_online
 
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="vouches"
+        )
+    )
+
     try:
         await init_db()
     except Exception as e:
@@ -567,7 +575,7 @@ async def on_ready():
         _sent_online = True
         channel = bot.get_channel(STATUS_CHANNEL_ID)
         if channel:
-            await channel.send(f"**AMP VOUCHER BOT CURRENTLY ONLINE** {CHECK}")
+            await channel.send("**AMP VOUCHER BOT CURRENTLY ONLINE** ✅")
 
     try:
         await bot.tree.sync()
@@ -575,7 +583,6 @@ async def on_ready():
         print(f"Slash sync error: {e}")
 
     print(f"Logged in as {bot.user}")
-
 
 # ---------- SLASH COMMANDS ----------
 @bot.tree.command(name="vouch", description="Create a vouch form")
@@ -586,6 +593,13 @@ async def vouch(interaction: discord.Interaction):
         ephemeral=True
     )
 
+@bot.tree.command(name="ping", description="Check bot latency")
+async def ping(interaction: discord.Interaction):
+    latency_ms = round(bot.latency * 1000)
+    await interaction.response.send_message(
+        f"🏓 Pong! **{latency_ms} ms**",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="vouches", description="Pull up all saved vouches for a user")
 @app_commands.describe(user="User to look up")
@@ -941,4 +955,5 @@ async def shutdown(interaction: discord.Interaction, code: str):
 
 
 bot.run(TOKEN)
+
 
