@@ -12,6 +12,7 @@ from discord.ext import commands
 
 from dotenv import load_dotenv
 
+# Load .env if present (optional). On Oracle you can still use ~/.bashrc env vars.
 load_dotenv()
 
 # Read secrets from environment variables
@@ -22,12 +23,11 @@ if not TOKEN:
     raise RuntimeError(
         "DISCORD_TOKEN is not set. Set it in ~/.bashrc (export DISCORD_TOKEN=...) "
         "or create a .env file with DISCORD_TOKEN=..."
-
- if not TOTP_SECRET:
-    print("WARNING: TOTP_SECRET is not set. /shutdown will not work until you set it.")
-
     )
 
+if not TOTP_SECRET:
+    print("WARNING: TOTP_SECRET is not set. /shutdown will not work until you set it.")
+    
 # ---------- INTENTS ----------
 intents = discord.Intents.default()
 intents.members = True  # needed for joined_at + role actions reliability
@@ -941,3 +941,4 @@ async def shutdown(interaction: discord.Interaction, code: str):
 
 
 bot.run(TOKEN)
+
