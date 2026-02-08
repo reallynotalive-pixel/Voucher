@@ -99,6 +99,9 @@ RESTRICTED_MIN_VOUCHES = 5
 RESTRICTED_MAX_AVG = 2.5
 
 
+
+
+
 # ---------- GUILD CONFIG (stored in SQLite) ----------
 # Keeps your constants as defaults but allows per-server overrides via /config.
 
