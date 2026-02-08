@@ -98,9 +98,281 @@ TRUSTED_MIN_AVG = 4.7
 RESTRICTED_MIN_VOUCHES = 5
 RESTRICTED_MAX_AVG = 2.5
 
+# ============================================================
+# ✅ SETUP WIZARD (Buttons + Select Menus)
+# ============================================================
+
+class SetupWizardState:
+    def __init__(self):
+        self.owner_id: int | None = None
+        self.status_channel_id: int | None = None
+        self.trusted_role_id: int | None = None
+        self.restricted_role_id: int | None = None
+        self.protected_role_ids: list[int] = []
+        self.trusted_min_vouches: int | None = None
+        self.trusted_min_avg: float | None = None
+        self.restricted_min_vouches: int | None = None
+        self.restricted_max_avg: float | None = None
+
+def _wizard_admin_only(interaction: discord.Interaction) -> bool:
+    return (
+        interaction.guild is not None
+        and interaction.user.guild_permissions.administrator
+    )
+
+def _fmt_role_id(rid: int | None) -> str:
+    if not rid or rid == 0:
+        return "Disabled"
+    return f"<@&{rid}> (`{rid}`)"
+
+def _fmt_chan_id(cid: int | None) -> str:
+    if not cid or cid == 0:
+        return "Not set"
+    return f"<#{cid}> (`{cid}`)"
+
+async def _wizard_embed(guild: discord.Guild, state: SetupWizardState) -> discord.Embed:
+    embed = discord.Embed(
+        title="Voucher Bot Setup Wizard",
+        description="Use the menus/buttons below to configure the bot.\nWhen finished, press **Save**.",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="Owner ID", value=f"`{state.owner_id or 0}`", inline=False)
+    embed.add_field(name="Status Channel", value=_fmt_chan_id(state.status_channel_id), inline=False)
+    embed.add_field(name="Trusted Role", value=_fmt_role_id(state.trusted_role_id), inline=True)
+    embed.add_field(name="Restricted Role", value=_fmt_role_id(state.restricted_role_id), inline=True)
+
+    if state.protected_role_ids:
+        prot = "\n".join([f"<@&{rid}> (`{rid}`)" for rid in state.protected_role_ids])
+    else:
+        prot = "None"
+    embed.add_field(name="Protected Roles (Immunity)", value=prot[:1024], inline=False)
+
+    # Thresholds
+    tv = state.trusted_min_vouches
+    ta = state.trusted_min_avg
+    rv = state.restricted_min_vouches
+    ra = state.restricted_max_avg
+
+    thresh_text = (
+        f"Trusted: **{tv if tv is not None else '—'}** vouches, avg **{ta if ta is not None else '—'}**+\n"
+        f"Restricted: **{rv if rv is not None else '—'}** vouches, avg **{ra if ra is not None else '—'}** or lower"
+    )
+    embed.add_field(name="Thresholds", value=thresh_text, inline=False)
+
+    embed.set_footer(text="Tip: You can re-run /setupwizard anytime.")
+    return embed
 
 
+class ThresholdsModal(discord.ui.Modal, title="Set Trust Thresholds"):
+    trusted_min_vouches = discord.ui.TextInput(label="Trusted min vouches", placeholder="25", required=True, max_length=6)
+    trusted_min_avg = discord.ui.TextInput(label="Trusted min avg (0-5)", placeholder="4.7", required=True, max_length=6)
+    restricted_min_vouches = discord.ui.TextInput(label="Restricted min vouches", placeholder="5", required=True, max_length=6)
+    restricted_max_avg = discord.ui.TextInput(label="Restricted max avg (0-5)", placeholder="2.5", required=True, max_length=6)
 
+    def __init__(self, view: "SetupWizardView"):
+        super().__init__()
+        self.view_ref = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # validate + store in state (no DB write yet)
+        try:
+            tv = int(str(self.trusted_min_vouches.value).strip())
+            ta = float(str(self.trusted_min_avg.value).strip())
+            rv = int(str(self.restricted_min_vouches.value).strip())
+            ra = float(str(self.restricted_max_avg.value).strip())
+        except ValueError:
+            return await interaction.response.send_message(f"{CROSS} Use numbers only.", ephemeral=True)
+
+        if tv < 0 or rv < 0:
+            return await interaction.response.send_message(f"{CROSS} Vouch counts can’t be negative.", ephemeral=True)
+        if not (0.0 <= ta <= 5.0) or not (0.0 <= ra <= 5.0):
+            return await interaction.response.send_message(f"{CROSS} Averages must be between 0 and 5.", ephemeral=True)
+
+        st = self.view_ref.state
+        st.trusted_min_vouches = tv
+        st.trusted_min_avg = ta
+        st.restricted_min_vouches = rv
+        st.restricted_max_avg = ra
+
+        # refresh wizard message
+        embed = await _wizard_embed(interaction.guild, st)  # type: ignore
+        await interaction.response.edit_message(embed=embed, view=self.view_ref)
+
+
+class SetupWizardView(discord.ui.View):
+    def __init__(self, requester_id: int, guild: discord.Guild, state: SetupWizardState):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.guild = guild
+        self.state = state
+
+        # Channel select (status channel)
+        self.channel_select = discord.ui.ChannelSelect(
+            placeholder="Pick Status Channel (where online/offline posts go)",
+            min_values=0,
+            max_values=1,
+            channel_types=[discord.ChannelType.text]
+        )
+        self.channel_select.callback = self._on_channel_selected
+        self.add_item(self.channel_select)
+
+        # Trusted role select
+        self.trusted_role_select = discord.ui.RoleSelect(
+            placeholder="Pick Trusted Role (optional)",
+            min_values=0,
+            max_values=1
+        )
+        self.trusted_role_select.callback = self._on_trusted_selected
+        self.add_item(self.trusted_role_select)
+
+        # Restricted role select
+        self.restricted_role_select = discord.ui.RoleSelect(
+            placeholder="Pick Restricted Role (optional)",
+            min_values=0,
+            max_values=1
+        )
+        self.restricted_role_select.callback = self._on_restricted_selected
+        self.add_item(self.restricted_role_select)
+
+        # Protected roles multi-select
+        self.protected_roles_select = discord.ui.RoleSelect(
+            placeholder="Pick Protected Roles (staff immunity) — multi-select allowed",
+            min_values=0,
+            max_values=10
+        )
+        self.protected_roles_select.callback = self._on_protected_selected
+        self.add_item(self.protected_roles_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(f"{CROSS} Only the admin who started setup can use this.", ephemeral=True)
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        embed = await _wizard_embed(interaction.guild, self.state)  # type: ignore
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _on_channel_selected(self, interaction: discord.Interaction):
+        if self.channel_select.values:
+            ch = self.channel_select.values[0]
+            self.state.status_channel_id = ch.id
+        else:
+            self.state.status_channel_id = 0
+        await self._refresh(interaction)
+
+    async def _on_trusted_selected(self, interaction: discord.Interaction):
+        if self.trusted_role_select.values:
+            role = self.trusted_role_select.values[0]
+            self.state.trusted_role_id = role.id
+        else:
+            self.state.trusted_role_id = 0
+        await self._refresh(interaction)
+
+    async def _on_restricted_selected(self, interaction: discord.Interaction):
+        if self.restricted_role_select.values:
+            role = self.restricted_role_select.values[0]
+            self.state.restricted_role_id = role.id
+        else:
+            self.state.restricted_role_id = 0
+        await self._refresh(interaction)
+
+    async def _on_protected_selected(self, interaction: discord.Interaction):
+        self.state.protected_role_ids = [r.id for r in self.protected_roles_select.values] if self.protected_roles_select.values else []
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Set Thresholds", style=discord.ButtonStyle.primary)
+    async def set_thresholds_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ThresholdsModal(self))
+
+    @discord.ui.button(label="Use Me as Owner", style=discord.ButtonStyle.secondary)
+    async def set_owner_me_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.state.owner_id = interaction.user.id
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success)
+    async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            return await interaction.response.send_message(f"{CROSS} Server only.", ephemeral=True)
+
+        gid = interaction.guild_id
+
+        # Fill defaults if user didn’t touch them yet
+        if self.state.owner_id is None:
+            self.state.owner_id = await cfg_get(gid, "OWNER_ID") or interaction.user.id
+        if self.state.status_channel_id is None:
+            self.state.status_channel_id = await cfg_get(gid, "STATUS_CHANNEL_ID") or 0
+        if self.state.trusted_role_id is None:
+            self.state.trusted_role_id = await cfg_get(gid, "TRUSTED_ROLE_ID") or 0
+        if self.state.restricted_role_id is None:
+            self.state.restricted_role_id = await cfg_get(gid, "RESTRICTED_ROLE_ID") or 0
+        if self.state.trusted_min_vouches is None:
+            self.state.trusted_min_vouches = await cfg_get(gid, "TRUSTED_MIN_VOUCHES")
+        if self.state.trusted_min_avg is None:
+            self.state.trusted_min_avg = await cfg_get(gid, "TRUSTED_MIN_AVG")
+        if self.state.restricted_min_vouches is None:
+            self.state.restricted_min_vouches = await cfg_get(gid, "RESTRICTED_MIN_VOUCHES")
+        if self.state.restricted_max_avg is None:
+            self.state.restricted_max_avg = await cfg_get(gid, "RESTRICTED_MAX_AVG")
+        if not self.state.protected_role_ids:
+            self.state.protected_role_ids = await cfg_get(gid, "PROTECTED_ROLE_IDS") or []
+
+        # Persist
+        await cfg_set(gid, "OWNER_ID", int(self.state.owner_id))
+        await cfg_set(gid, "STATUS_CHANNEL_ID", int(self.state.status_channel_id or 0))
+        await cfg_set(gid, "TRUSTED_ROLE_ID", int(self.state.trusted_role_id or 0))
+        await cfg_set(gid, "RESTRICTED_ROLE_ID", int(self.state.restricted_role_id or 0))
+        await cfg_set(gid, "PROTECTED_ROLE_IDS", self.state.protected_role_ids)
+
+        await cfg_set(gid, "TRUSTED_MIN_VOUCHES", int(self.state.trusted_min_vouches or 0))
+        await cfg_set(gid, "TRUSTED_MIN_AVG", float(self.state.trusted_min_avg or 0.0))
+        await cfg_set(gid, "RESTRICTED_MIN_VOUCHES", int(self.state.restricted_min_vouches or 0))
+        await cfg_set(gid, "RESTRICTED_MAX_AVG", float(self.state.restricted_max_avg or 0.0))
+
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+
+        embed = await _wizard_embed(interaction.guild, self.state)
+        embed.description = f"{CHECK} Saved! You can run `/setup` to view, or `/setupwizard` to change again."
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+        await interaction.response.edit_message(content=f"{WARN} Setup cancelled.", view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+
+
+@bot.tree.command(name="setupwizard", description="Interactive setup wizard (Admin only).")
+async def setupwizard(interaction: discord.Interaction):
+    if not _wizard_admin_only(interaction):
+        return await interaction.response.send_message(f"{CROSS} Admin only.", ephemeral=True)
+
+    gid = interaction.guild_id
+
+    # seed wizard with current saved config (or defaults)
+    st = SetupWizardState()
+    st.owner_id = await cfg_get(gid, "OWNER_ID") or interaction.user.id
+    st.status_channel_id = await cfg_get(gid, "STATUS_CHANNEL_ID") or 0
+    st.trusted_role_id = await cfg_get(gid, "TRUSTED_ROLE_ID") or 0
+    st.restricted_role_id = await cfg_get(gid, "RESTRICTED_ROLE_ID") or 0
+    st.protected_role_ids = await cfg_get(gid, "PROTECTED_ROLE_IDS") or []
+
+    st.trusted_min_vouches = await cfg_get(gid, "TRUSTED_MIN_VOUCHES")
+    st.trusted_min_avg = await cfg_get(gid, "TRUSTED_MIN_AVG")
+    st.restricted_min_vouches = await cfg_get(gid, "RESTRICTED_MIN_VOUCHES")
+    st.restricted_max_avg = await cfg_get(gid, "RESTRICTED_MAX_AVG")
+
+    view = SetupWizardView(requester_id=interaction.user.id, guild=interaction.guild, state=st)  # type: ignore
+    embed = await _wizard_embed(interaction.guild, st)  # type: ignore
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 # ---------- GUILD CONFIG (stored in SQLite) ----------
 # Keeps your constants as defaults but allows per-server overrides via /config.
