@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+import logging
+import signal
 import os
 import discord
 import pyotp
@@ -37,7 +39,30 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 OWNER_ID = 906781117632368730
 STATUS_CHANNEL_ID = 1461148246863773698
 
-DB_FILE = "vouches.db"
+DB_FILE = vouches.db
+
+# ---------- LOGGING ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("voucher")
+
+# ---------- SQLITE HARDENING (NO LOGIC CHANGES) ----------
+_db_lock = asyncio.Lock()
+
+async def db_connect(path: str):
+    """
+    Returns an aiosqlite connection with production-safe pragmas.
+    Keeps same schema/queries/behavior—just makes SQLite more reliable under load.
+    """
+    db = await aiosqlite.connect(path)
+    # WAL helps concurrency; busy_timeout reduces "database is locked"
+    await db.execute("PRAGMA journal_mode=WAL;")
+    await db.execute("PRAGMA synchronous=NORMAL;")
+    await db.execute("PRAGMA busy_timeout=5000;")
+    await db.execute("PRAGMA foreign_keys=ON;")
+    return db
 
 PAGE_SIZE = 5  # vouches per page
 
@@ -75,7 +100,7 @@ _softlock_previous = {}  # channel_id -> previous overwrite for @everyone
 
 # ---------- DB ----------
 async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with _db_lock:     async with await db_connect(DB_FILE) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS vouches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +125,7 @@ def utc_now_str() -> str:
 async def fetch_vouches_page(guild_id: int, vouched_user_id: int, page: int):
     """Returns (rows, total_count). page is 0-based."""
     offset = page * PAGE_SIZE
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with _db_lock:     async with await db_connect(DB_FILE) as db:
         cur_total = await db.execute("""
             SELECT COUNT(*)
             FROM vouches
@@ -122,7 +147,7 @@ async def fetch_vouches_page(guild_id: int, vouched_user_id: int, page: int):
 
 async def get_user_trust_stats(guild_id: int, user_id: int):
     """Returns dict of trust stats for a vouched user."""
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with _db_lock:     async with await db_connect(DB_FILE) as db:
         cur = await db.execute("""
             SELECT COUNT(*), AVG(rating), SUM(suspicious)
             FROM vouches
@@ -153,7 +178,7 @@ async def detect_suspicious_vouch(guild_id: int, vouched_user_id: int, voucher_u
     - Mutual vouching loop recently
     Returns 1 if suspicious else 0.
     """
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with _db_lock:     async with await db_connect(DB_FILE) as db:
         # same voucher -> same target within last 7 days
         cur = await db.execute("""
             SELECT COUNT(*)
@@ -504,7 +529,7 @@ class VouchModal(discord.ui.Modal):
 
         # Save to DB
         created_at = utc_now_str()
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with _db_lock:     async with await db_connect(DB_FILE) as db:
             await db.execute("""
                 INSERT INTO vouches (
                     guild_id, vouched_user_id, voucher_user_id,
@@ -583,6 +608,35 @@ async def on_ready():
         print(f"Slash sync error: {e}")
 
     print(f"Logged in as {bot.user}")
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Avoid leaking stack traces to users
+    log.exception("App command error: %s", error)
+
+    msg = f"{CROSS} Something went wrong running that command."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    # Catches event handler errors
+    log.exception("Unhandled event error: %s", event)
+
+# Optional: catch UI view errors (menus/buttons/modals)
+async def _safe_send_ephemeral(interaction: discord.Interaction, text: str):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except Exception:
+        pass
 
 # ---------- SLASH COMMANDS ----------
 @bot.tree.command(name="vouch", description="Create a vouch form")
@@ -729,7 +783,7 @@ async def stats(interaction: discord.Interaction):
     if interaction.guild is None:
         return await interaction.response.send_message(f"{CROSS} Server only.", ephemeral=True)
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with _db_lock:     async with await db_connect(DB_FILE) as db:
         cur = await db.execute("""
             SELECT COUNT(*), AVG(rating), SUM(suspicious)
             FROM vouches
@@ -769,7 +823,7 @@ async def leaderboard(interaction: discord.Interaction):
     if interaction.guild is None:
         return await interaction.response.send_message(f"{CROSS} Server only.", ephemeral=True)
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with _db_lock:     async with await db_connect(DB_FILE) as db:
         cur = await db.execute("""
             SELECT vouched_user_id, COUNT(*) AS c, AVG(rating) AS a
             FROM vouches
@@ -801,7 +855,7 @@ async def exportvouches(interaction: discord.Interaction, user: discord.Member):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message(f"{CROSS} Admin only.", ephemeral=True)
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with _db_lock:     async with await db_connect(DB_FILE) as db:
         cur = await db.execute("""
             SELECT id, voucher_user_id, trader_user_id, middleman_user_id, rating, traded_item, created_at, suspicious
             FROM vouches
@@ -929,6 +983,36 @@ async def unmute(interaction: discord.Interaction, user: discord.Member, reason:
     embed.set_footer(text=f"Action by {interaction.user}")
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
 
+def _install_signal_handlers():
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        return
+
+    async def _graceful_close():
+        log.info("Graceful shutdown requested")
+        try:
+            channel = bot.get_channel(STATUS_CHANNEL_ID)
+            if channel:
+                await channel.send("**AMP VOUCHER BOT CURRENTLY OFFLINE (Host restart/stop)**")
+        except Exception:
+            pass
+        try:
+            await bot.close()
+        except Exception:
+            pass
+
+    def _handler():
+        asyncio.create_task(_graceful_close())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handler)
+        except NotImplementedError:
+            # Windows
+            pass
+
+_install_signal_handlers()
 
 # ---------- SHUTDOWN ----------
 @bot.tree.command(name="shutdown", description="Shut down the bot (owner only)")
