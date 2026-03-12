@@ -805,136 +805,74 @@ class VouchForSelectStep(StepBaseView):
         await interaction.response.send_modal(VouchModal(self.trader, self.middleman, vouched_user))
 
 
-# ---------- MODAL ----------
+# ---------- VOUCH COMMAND BASE ----------
 class VouchModal(discord.ui.Modal):
-    def __init__(self, trader: discord.Member, middleman: discord.Member | None, vouched_user: discord.Member):
-        super().__init__(title="Vouch")
+    def __init__(self, vouch_type: str, trader: discord.Member, middleman: discord.Member | None, vouched_user: discord.Member):
+        super().__init__(title=f"{vouch_type} Vouch")
+        self.vouch_type = vouch_type
         self.trader = trader
         self.middleman = middleman
         self.vouched_user = vouched_user
 
-    rating = discord.ui.TextInput(
-        label="Rating (1-5)",
-        placeholder="Example: 5",
-        max_length=1,
-        required=True
-    )
-
-    traded_item = discord.ui.TextInput(
-        label="What did you trade to them?",
-        placeholder="Describe the item(s)",
-        required=True
-    )
+    rating = discord.ui.TextInput(label="Rating (1-5)", placeholder="5", max_length=1, required=True)
+    traded_item = discord.ui.TextInput(label="What did you trade?", placeholder="Item description", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Validate rating
         try:
             stars = int(self.rating.value)
             if not 1 <= stars <= 5:
                 raise ValueError
         except ValueError:
-            await interaction.response.send_message(
-                f"{CROSS} Rating must be a number between **1 and 5**.",
-                ephemeral=True
-            )
-            return
+            return await interaction.response.send_message("Rating must be 1-5.", ephemeral=True)
 
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                f"{CROSS} This command can only be used in a server.",
-                ephemeral=True
-            )
-            return
-
-        # Requirement #8: Account age / join age checks
-        now_utc = datetime.now(timezone.utc)
-        if interaction.user.created_at:
-            acct_age_days = (now_utc - interaction.user.created_at).days
-            if acct_age_days < MIN_ACCOUNT_AGE_DAYS:
-                await interaction.response.send_message(
-                    f"{CROSS} Your account must be at least **{MIN_ACCOUNT_AGE_DAYS} days** old to submit vouches.",
-                    ephemeral=True
-                )
-                return
-
-        if interaction.user.joined_at:
-            join_hours = (now_utc - interaction.user.joined_at).total_seconds() / 3600.0
-            if join_hours < MIN_SERVER_JOIN_HOURS:
-                await interaction.response.send_message(
-                    f"{CROSS} You must be in this server for at least **{MIN_SERVER_JOIN_HOURS} hours** to submit vouches.",
-                    ephemeral=True
-                )
-                return
-
-        vouched_user_id = self.vouched_user.id
-
-        # Fake vouch detection (#2)
-        suspicious = await detect_suspicious_vouch(interaction.guild_id, vouched_user_id, interaction.user.id)
-
-        # Build embed
-        embed = discord.Embed(
-            title=f"{STAR} Trade Vouch",
-            color=discord.Color.purple()
-        )
-        embed.add_field(name="Rating", value=(STAR * stars) + (f" {WARN}" if suspicious else ""), inline=False)
-        embed.add_field(name="Who did you trade with", value=self.trader.mention, inline=False)
-        embed.add_field(name="Middleman used", value=self.middleman.mention if self.middleman else "None", inline=False)
-        embed.add_field(name="What did you trade to them", value=self.traded_item.value, inline=False)
-        embed.add_field(name="Vouch for", value=self.vouched_user.mention, inline=False)
-
-        embed.set_footer(
-            text=f"Vouch submitted by {interaction.user}",
-            icon_url=interaction.user.display_avatar.url
-        )
-
-        # Save to DB
         created_at = utc_now_str()
         async with _db_lock, db_open(DB_FILE) as db:
-            await db.execute("""
-                INSERT INTO vouches (
-                    guild_id, vouched_user_id, voucher_user_id,
-                    trader_user_id, middleman_user_id,
-                    rating, traded_item, created_at, suspicious
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                interaction.guild_id,
-                vouched_user_id,
-                interaction.user.id,
-                self.trader.id,
-                self.middleman.id if self.middleman else None,
-                stars,
-                self.traded_item.value,
-                created_at,
-                suspicious
-            ))
-            await db.commit()
-
-        # #11 DM receipt to vouched user
-        try:
-            dm = discord.Embed(
-                title=f"{STAR} You received a new vouch!",
-                description=f"Server: **{interaction.guild.name}**",
-                color=discord.Color.green()
+            cursor = await db.execute(
+                "INSERT INTO vouches (guild_id, vouched_user_id, voucher_user_id, trader_user_id, middleman_user_id, rating, traded_item, created_at, vouch_type, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    interaction.guild_id,
+                    self.vouched_user.id,
+                    interaction.user.id,
+                    self.trader.id,
+                    self.middleman.id if self.middleman else None,
+                    stars,
+                    self.traded_item.value,
+                    created_at,
+                    self.vouch_type,
+                    0
+                )
             )
-            dm.add_field(name="From", value=interaction.user.mention, inline=False)
-            dm.add_field(name="Rating", value=STAR * stars, inline=False)
-            dm.add_field(name="Trader", value=self.trader.mention, inline=False)
-            dm.add_field(name="Middleman", value=self.middleman.mention if self.middleman else "None", inline=False)
-            dm.add_field(name="Item", value=self.traded_item.value, inline=False)
-            if suspicious:
-                dm.add_field(name="Notice", value=f"{WARN} This vouch was auto-flagged as suspicious.", inline=False)
-            await self.vouched_user.send(embed=dm, allowed_mentions=discord.AllowedMentions(users=True))
-        except Exception:
-            pass
+            await db.commit()
+            vouch_id = cursor.lastrowid
 
-        # #15 Trust gate role assignment
-        await apply_trust_gate(interaction.guild, self.vouched_user)
+        # Send verification message
+        embed = discord.Embed(title=f"{self.vouch_type} Voucher Pending Verification", color=discord.Color.orange())
+        embed.add_field(name="Trader", value=self.trader.mention)
+        embed.add_field(name="Vouched User", value=self.vouched_user.mention)
+        embed.add_field(name="Item", value=self.traded_item.value)
+        embed.add_field(name="Rating", value=STAR*stars)
+        embed.set_footer(text=f"Voucher ID: {vouch_id}")
+        await interaction.response.send_message(embed=embed, view=VerifyVouchView(vouch_id), allowed_mentions=discord.AllowedMentions(users=True))
 
-        await interaction.response.send_message(
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
+# ---------- VOUCH VERIFICATION VIEW ----------
+class VerifyVouchView(discord.ui.View):
+    def __init__(self, vouch_id: int):
+        super().__init__(timeout=None)
+        self.vouch_id = vouch_id
 
+    @discord.ui.button(label="Confirm Trade", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with _db_lock, db_open(DB_FILE) as db:
+            await db.execute("UPDATE vouches SET verified=1 WHERE id=?", (self.vouch_id,))
+            await db.commit()
+        await interaction.response.edit_message(content="✅ Vouch confirmed!", view=None)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with _db_lock, db_open(DB_FILE) as db:
+            await db.execute("DELETE FROM vouches WHERE id=?", (self.vouch_id,))
+            await db.commit()
+        await interaction.response.edit_message(content="❌ Vouch denied and removed.", view=None)
 
 # ---------- ONLINE STATUS ----------
 _sent_online = False
@@ -1008,13 +946,21 @@ async def _safe_send_ephemeral(interaction: discord.Interaction, text: str):
         pass
 
 # ---------- SLASH COMMANDS ----------
-@bot.tree.command(name="vouch", description="Create a vouch form")
-async def vouch(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "Step 1/3: Select the **Trader**.",
-        view=TraderSelectStep(requester_id=interaction.user.id),
-        ephemeral=True
-    )
+@bot.tree.command(name="vouchbuy", description="Create a BUY vouch")
+async def vouchbuy(interaction: discord.Interaction):
+    await interaction.response.send_message("Select Trader for BUY vouch:", ephemeral=True)
+
+@bot.tree.command(name="vouchtrade", description="Create a TRADE vouch")
+async def vouchbuy(interaction: discord.Interaction):
+    await interaction.response.send_message("Select Trader for TRADE vouch:", ephemeral=True)
+
+@bot.tree.command(name="vouchgw", description="Create a GIVEAWAY vouch")
+async def vouchbuy(interaction: discord.Interaction):
+    await interaction.response.send_message("Select Trader for GIVEWAY vouch:", ephemeral=True)
+
+@bot.tree.command(name="vouchbid", description="Create a BID vouch")
+async def vouchbuy(interaction: discord.Interaction):
+    await interaction.response.send_message("Select Trader for BID vouch:", ephemeral=True)
 
 @bot.tree.command(name="ping", description="Check bot latency")
 async def ping(interaction: discord.Interaction):
